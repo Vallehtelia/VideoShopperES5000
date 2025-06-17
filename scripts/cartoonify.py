@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os
-import cv2
 import time
 import torch
 import shutil
@@ -11,74 +9,100 @@ from diffusers import StableDiffusionInstructPix2PixPipeline
 from PIL import Image
 from pathlib import Path
 from tqdm import tqdm
-from torchvision import transforms
 
-ROOT_DIR = Path(__file__).resolve().parent.parent
-PROCESSED_DIR = ROOT_DIR / "processed"
-CARTOONIZED_DIR = ROOT_DIR / "cartoonized"
-FRAMES_DIR = ROOT_DIR / "frames"
+# Paths
+def get_paths():
+    root = Path(__file__).resolve().parent.parent
+    return {
+        "processed": root / "processed",
+        "cartoonized": root / "cartoonized",
+        "frames": root / "frames"
+    }
 
-CARTOONIZED_DIR.mkdir(parents=True, exist_ok=True)
-FRAMES_DIR.mkdir(parents=True, exist_ok=True)
+paths = get_paths()
+for p in paths.values():
+    p.mkdir(parents=True, exist_ok=True)
 
+# Ensure GPU available
 if not torch.cuda.is_available():
     raise EnvironmentError("CUDA is not available. Please run this script on a machine with a GPU.")
 
+# Load model with 8-bit quantization to reduce VRAM usage
 pipe = StableDiffusionInstructPix2PixPipeline.from_pretrained(
-    "AnalogMutations/cartoonizer", torch_dtype=torch.float16
-).to("cuda")
+    "AnalogMutations/cartoonizer",
+    torch_dtype=torch.float16,
+    load_in_8bit=True,          # quantize weights to 8-bit
+    device_map="balanced"         # automatically place layers on GPU
+)
 pipe.enable_attention_slicing()
+# Enable memory-efficient attention and CPU offload to reduce peak GPU VRAM usage
+try:
+    pipe.enable_xformers_memory_efficient_attention()
+except Exception:
+    pass  # xformers might not be installed
+
+# Offload model layers to CPU sequentially
+pipe.reset_device_map()
+pipe.enable_model_cpu_offload()
 pipe.safety_checker = lambda images, **kwargs: (images, [False] * len(images))
 
-video_files = sorted(PROCESSED_DIR.glob("*.mp4"))[:3]
-if not video_files:
-    raise FileNotFoundError("No .mp4 files found in ~/processed/")
+# Helper to resize
+from PIL import Image as PILImage
 
-for video_path in video_files:
+def resize_image(img: PILImage, size=(512, 512)) -> PILImage:
+    return img.resize(size, PILImage.BICUBIC)
+
+# Process videos in processed directory
+target_files = sorted(paths["processed"].glob("*.mp4"))
+if not target_files:
+    raise FileNotFoundError("No .mp4 files found in processed directory.")
+
+BATCH_SIZE = 4
+prompts = ["Cartoonize" for _ in range(BATCH_SIZE)]
+
+for video_path in target_files:
     basename = video_path.stem
-    output_video = CARTOONIZED_DIR / f"{basename}_cartoonized.mp4"
-
     print(f"\nProcessing: {basename}")
-    print("Extracting frames...")
-    frames_out_dir = FRAMES_DIR / basename
-    shutil.rmtree(frames_out_dir, ignore_errors=True)
-    frames_out_dir.mkdir(parents=True)
-    frame_pattern = str(frames_out_dir / "frame_%05d.png")
-    subprocess.run(["ffmpeg", "-i", str(video_path), frame_pattern], check=True)
 
-    frame_files = sorted(frames_out_dir.glob("frame_*.png"))
-    total_frames = len(frame_files)
+    # Extract frames
+    dir_frames = paths["frames"] / basename
+    shutil.rmtree(dir_frames, ignore_errors=True)
+    dir_frames.mkdir(parents=True)
+    pattern = str(dir_frames / "frame_%05d.png")
+    subprocess.run(["ffmpeg", "-i", str(video_path), pattern], check=True)
+
+    # Cartoonify in batches
+    frame_paths = sorted(dir_frames.glob("frame_*.png"))
+    total = len(frame_paths)
     start_time = time.time()
 
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Resize((512, 512)),
-        transforms.ToPILImage()
-    ])
-
-    print("Cartoonifying frames...")
-    for idx, frame_path in enumerate(tqdm(frame_files)):
-        img = Image.open(frame_path).convert("RGB")
-        img = transform(img)
-        image_out = pipe(prompt="Cartoonize the following image", image=img).images[0]
-        image_out.save(frame_path)
+    for i in range(0, total, BATCH_SIZE):
+        batch = frame_paths[i:i + BATCH_SIZE]
+        imgs = [resize_image(Image.open(fp).convert("RGB")) for fp in batch]
+        outs = pipe(prompt=prompts[:len(batch)], image=imgs).images
+        for out_img, fp in zip(outs, batch):
+            out_img.save(fp)
 
         elapsed = time.time() - start_time
-        fps = (idx + 1) / elapsed
-        eta = (total_frames - idx - 1) / fps if fps > 0 else 0
-        tqdm.write(f"ETA: {eta:.2f} seconds")
+        done = i + len(batch)
+        fps = done / elapsed if elapsed > 0 else 0
+        eta = (total - done) / fps if fps > 0 else 0
+        tqdm.write(f"ETA: {eta:.1f}s ({done}/{total})")
 
-    print("Combining frames back to video...")
-    cartoon_temp = CARTOONIZED_DIR / f"{basename}_temp.mp4"
+    # Reassemble video
+    print("Combining frames to video...")
+    temp_vid = paths["cartoonized"] / f"{basename}_temp.mp4"
     subprocess.run([
-        "ffmpeg", "-y", "-framerate", "25", "-i", str(frames_out_dir / "frame_%05d.png"),
-        "-c:v", "libx264", "-pix_fmt", "yuv420p", str(cartoon_temp)
+        "ffmpeg", "-y", "-framerate", "15", "-i", str(dir_frames / "frame_%05d.png"),
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", str(temp_vid)
     ], check=True)
 
-    print("Merging audio from original video...")
+    # Merge audio
+    final_vid = paths["cartoonized"] / f"{basename}_cartoonized.mp4"
+    print("Merging audio...")
     subprocess.run([
-        "ffmpeg", "-y", "-i", str(cartoon_temp), "-i", str(video_path),
-        "-c:v", "copy", "-map", "0:v:0", "-map", "1:a:0", "-shortest", str(output_video)
+        "ffmpeg", "-y", "-i", str(temp_vid), "-i", str(video_path),
+        "-c:v", "copy", "-map", "0:v:0", "-map", "1:a:0", "-shortest", str(final_vid)
     ], check=True)
 
-    print(f"Done. Cartoonized video saved to: {output_video}")
+    print(f"Done: {final_vid}")

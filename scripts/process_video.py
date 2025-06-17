@@ -2,6 +2,7 @@
 """
 CLI script to cut videos from root/videos/ into overlapping 30-second segments and save to root/processed/.
 Segments overlap by 1 second. If the final remaining part is shorter than 20 seconds, it is merged into the previous segment.
+This version re-encodes video at 15 fps to reduce frame rate.
 Place this script in root/scripts/cut_videos.py and run it from the command line.
 """
 import os
@@ -9,10 +10,11 @@ import sys
 import shutil
 import subprocess
 
-SEGMENT_LENGTH = 30  # seconds
+SEGMENT_LENGTH = 40  # seconds
 OVERLAP = 1          # seconds
 STEP = SEGMENT_LENGTH - OVERLAP
 MIN_REMAINDER = 20   # seconds
+TARGET_FPS = 15      # frames per second
 
 
 def ffmpeg_installed():
@@ -46,13 +48,11 @@ def make_segments(duration):
     for s in starts:
         end = min(s + SEGMENT_LENGTH, duration)
         segments.append((s, end))
-    # Check last segment length
+    # Merge last if too short
     if len(segments) > 1:
         last_start, last_end = segments[-1]
-        length = last_end - last_start
-        if length < MIN_REMAINDER:
-            # Merge into previous
-            prev_start, prev_end = segments[-2]
+        if (last_end - last_start) < MIN_REMAINDER:
+            prev_start, _ = segments[-2]
             segments[-2] = (prev_start, duration)
             segments.pop()
     return segments
@@ -61,7 +61,6 @@ def make_segments(duration):
 def cut_video(input_path, output_dir):
     filename = os.path.basename(input_path)
     name, ext = os.path.splitext(filename)
-
     duration = get_duration(input_path)
     segments = make_segments(duration)
 
@@ -69,24 +68,26 @@ def cut_video(input_path, output_dir):
         seg_duration = end - start
         output_name = f"{name}-{idx}.mp4"
         output_path = os.path.join(output_dir, output_name)
-        # ffmpeg command: -ss start -i input -t seg_duration -c copy
         cmd = [
             'ffmpeg', '-y',
             '-ss', str(start),
             '-i', input_path,
             '-t', str(seg_duration),
-            '-c', 'copy',
+            '-vf', f'fps={TARGET_FPS}',  # re-encode at target fps
+            '-c:v', 'libx264',
+            '-preset', 'fast',
+            '-crf', '23',
+            '-c:a', 'copy',
             output_path
         ]
-        print(f"Creating segment {idx}: {start:.2f}s to {end:.2f}s -> {output_name}")
+        print(f"Creating segment {idx}: {start:.2f}s to {end:.2f}s at {TARGET_FPS}fps -> {output_name}")
         try:
-            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+            subprocess.run(cmd, check=True)
         except subprocess.CalledProcessError as e:
             print(f"Error creating segment {idx} for {filename}: {e}")
 
 
 def main():
-    # Check for ffmpeg and ffprobe
     if not ffmpeg_installed() or not ffprobe_installed():
         print("ffmpeg and/or ffprobe not found. Please install FFmpeg.")
         sys.exit(1)

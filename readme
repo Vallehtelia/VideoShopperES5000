@@ -1,0 +1,7 @@
+python3 -m venv .venv
+source .venv/bin/activate
+
+pip install torch torchvision diffusers transformers accelerate safetensors tqdm bitsandbytes xformers
+
+sudo apt update
+sudo apt install ffmpeg
